@@ -45,6 +45,35 @@ import sys
 from pathlib import Path
 from typing import Literal
 
+# --- FIX: Patch TileLang Validation Logic ---
+try:
+    # 1. Force load the utility module that contains the strict validation
+    import tilelang.utils.target
+    
+    print("[PTQ] Patching tilelang.utils.target.determine_target to force sm_90...")
+
+    # 2. Define a bypass function that always returns the correct TVM string
+    # This prevents the "AssertionError" and the "stod" error simultaneously.
+    def _forced_determine_target(target):
+        return "cuda -arch=sm_90"
+
+    # 3. Overwrite the function in the source module
+    # Any subsequent imports (like from modelopt) will pick up this patched version.
+    tilelang.utils.target.determine_target = _forced_determine_target
+    
+    print("[PTQ] Patch successful. Architecture forced to H100/H200 (sm_90).")
+
+except ImportError:
+    print("[PTQ] Warning: tilelang not installed or not found. Skipping patch.")
+except Exception as e:
+    print(f"[PTQ] Patch failed: {e}")
+
+# 4. Ensure CUDA path is visible (Safety check)
+if "/usr/local/cuda/bin" not in os.environ["PATH"]:
+    os.environ["PATH"] = "/usr/local/cuda/bin:" + os.environ["PATH"]
+# --------------------------------------------
+
+
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -64,16 +93,16 @@ from modelopt.torch.quantization.utils import (
 from modelopt.torch.utils.dataset_utils import get_dataset_dataloader
 from modelopt.torch.utils.distributed import ParallelState
 
-DS_V3_PATH = Path(__file__).resolve().parent / "DeepSeek-V3/inference"
 DS_V3_2_PATH = Path(__file__).resolve().parent / "DeepSeek-V3.2-Exp/inference"
+os.environ["TVM_TARGET"] = "cuda -arch=sm_90"
+if "/usr/local/cuda/bin" not in os.environ["PATH"]:
+    os.environ["PATH"] = "/usr/local/cuda/bin:" + os.environ["PATH"]
 
 if DS_V3_2_PATH.exists():
     sys.path.append(str(DS_V3_2_PATH))
-elif DS_V3_PATH.exists():
-    sys.path.append(str(DS_V3_PATH))
 else:
     raise ValueError(
-        f"DeepSeek-V3 or DeepSeek-V3.2-Exp not found in {Path(__file__).resolve().parent}"
+        f"DeepSeek-V3.2-Exp not found in {Path(__file__).resolve().parent}"
     )
 
 import model as deekseep_model  # noqa: E402
@@ -286,18 +315,91 @@ def ptq(
     # quantize the model
     ## create dataset
     device = next(model.parameters()).device
-    calib_dataset = get_dataset_dataloader(
-        dataset_name=["cnn_dailymail", "nemotron-post-training-dataset-v2"],
-        tokenizer=tokenizer,
-        batch_size=batch_size,
-        num_samples=[calib_size, calib_size],
-        device=device,
-    )
+    
+    # --- FIX START: Logic adapted from NVIDIA ModelOpt Utils ---
+    from datasets import load_dataset
+    print("Loading calibration dataset: BAAI/Infinity-Instruct (Config: 0625)...")
+    
+    # Load the specific split used in the reference code
+    ds = load_dataset("BAAI/Infinity-Instruct", "0625", split="train")
+    
+    calib_data = []
+    print(f"Collecting {calib_size} samples...")
+    
+    count = 0
+    for sample in ds:
+        if count >= calib_size:
+            break
+            
+        # 1. Preprocess: Extract conversations and normalize roles
+        # Logic from: nvidia/modelopt/torch/utils/dataset_utils.py
+        try:
+            processed_conversations = []
+            if "conversations" in sample:
+                for x in sample["conversations"]:
+                    # map 'human' -> 'user', 'gpt' -> 'assistant'
+                    # use 'value' key as per reference code
+                    role = x.get("from", "").replace("human", "user").replace("gpt", "assistant")
+                    content = x.get("value", "")
+                    processed_conversations.append({"role": role, "content": content})
+            
+            # 2. Convert to text using tokenizer template
+            # If template fails (e.g. missing), fall back to joining values
+            if tokenizer.chat_template:
+                text = tokenizer.apply_chat_template(processed_conversations, tokenize=False)
+            else:
+                # Fallback: just join the content values with newlines
+                text = "\n".join([msg["content"] for msg in processed_conversations])
+
+            if len(text.strip()) > 5:
+                calib_data.append(text)
+                count += 1
+                
+        except Exception as e:
+            # Skip malformed rows silently to keep going
+            continue
+
+    if len(calib_data) == 0:
+        raise ValueError("Calibration dataset is empty! The dataset loop produced no valid samples.")
+
+    print(f"Tokenizing {len(calib_data)} samples...")
+    
+    # Tokenize
+    batch_encoded = tokenizer(
+        calib_data,
+        return_tensors="pt",
+        padding=True,
+        truncation=True,
+        max_length=2048 # Using 2048 to be safe with memory
+    ).input_ids
+
+    if batch_encoded.size(1) == 0:
+         raise ValueError("Tokenizer produced empty tensors.")
+
+    if torch.cuda.is_available():
+        batch_encoded = batch_encoded.to(device)
+
+    class SimpleCalibLoader:
+        def __init__(self, data, batch_size):
+            self.data = data
+            self.batch_size = batch_size
+            self.n = len(data)
+
+        def __iter__(self):
+            for i in range(0, self.n, self.batch_size):
+                yield self.data[i : i + self.batch_size]
+
+        def __len__(self):
+            return (self.n + self.batch_size - 1) // self.batch_size
+
+    calib_dataset = SimpleCalibLoader(batch_encoded, batch_size)
+    # --- FIX END ---
 
     ## define calib loop
     def calibrate_loop(model):
-        for data in tqdm(calib_dataset):
-            model(data["input_ids"])
+        for batch in tqdm(calib_dataset, desc="Calibrating"):
+             if batch.numel() > 0:
+                model(batch)
 
     ## handle DeepSeek model structures
     transformer = model.model if hasattr(model, "model") else model
@@ -413,5 +515,16 @@ if __name__ == "__main__":
     tokenizer = AutoTokenizer.from_pretrained(
         args.model_path, trust_remote_code=args.trust_remote_code
     )
+    if tokenizer.chat_template is None:
+        print("Chat template missing. Assigning default DeepSeek-compatible template...")
+        tokenizer.chat_template = (
+            "{% for message in messages %}"
+            "{% if message['role'] == 'user' %}"
+            "{{ '<｜User｜>' + message['content'] }}"
+            "{% elif message['role'] == 'assistant' %}"
+            "{{ '<｜Assistant｜>' + message['content'] + '<｜end of sentence｜>' }}"
+            "{% endif %}"
+            "{% endfor %}"
+        )
     model = ptq(model, tokenizer, args.quant_cfg, args.batch_size, args.calib_size)
     save_amax_and_quant_config(model, args.output_path, not args.disable_fp8_kvcache)
